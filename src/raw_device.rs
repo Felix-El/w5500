@@ -45,17 +45,24 @@ impl<SpiBus: Bus> RawDevice<SpiBus> {
     // * `buffer` - The location to read data into. The length of this slice determines how much
     // data is read.
     // * `offset` - The offset into current RX data to start reading from in bytes.
+    // * `post_skip` - Skip so many bytes after reading data.
     //
     // # Returns
     // The number of bytes successfully read.
-    fn read_bytes(&mut self, buffer: &mut [u8], offset: u16) -> Result<usize, SpiBus::Error> {
+    fn read_bytes(
+        &mut self,
+        buffer: &mut [u8],
+        offset: u16,
+        post_skip: u16,
+    ) -> Result<usize, SpiBus::Error> {
         let rx_size = self.raw_socket.get_receive_size(&mut self.bus)? as usize;
 
-        let read_buffer = if rx_size > buffer.len() + offset as usize {
-            buffer
-        } else {
-            &mut buffer[..rx_size - offset as usize]
-        };
+        let (read_buffer, read_post_skip) =
+            if let Some(post_avail) = rx_size.checked_sub(buffer.len() + offset as usize) {
+                (buffer, core::cmp::min(post_skip as usize, post_avail))
+            } else {
+                (&mut buffer[..rx_size - offset as usize], 0)
+            };
 
         let read_pointer = self
             .raw_socket
@@ -65,7 +72,9 @@ impl<SpiBus: Bus> RawDevice<SpiBus> {
             .read_frame(self.raw_socket.rx_buffer(), read_pointer, read_buffer)?;
         self.raw_socket.set_rx_read_pointer(
             &mut self.bus,
-            read_pointer.wrapping_add(read_buffer.len() as u16),
+            read_pointer
+                .wrapping_add(read_buffer.len() as u16)
+                .wrapping_add(read_post_skip as u16),
         )?;
 
         Ok(read_buffer.len())
@@ -89,7 +98,7 @@ impl<SpiBus: Bus> RawDevice<SpiBus> {
         // Refer to https://forum.wiznet.io/t/topic/979/2 for more information.
         let expected_frame_size: usize = {
             let mut frame_bytes = [0u8; 2];
-            assert!(self.read_bytes(&mut frame_bytes[..], 0)? == 2);
+            assert!(self.read_bytes(&mut frame_bytes[..], 0, 0)? == 2);
 
             u16::from_be_bytes(frame_bytes) as usize - 2
         };
@@ -101,18 +110,17 @@ impl<SpiBus: Bus> RawDevice<SpiBus> {
             frame
         };
 
-        let received_frame_size = self.read_bytes(read_buffer, 2)?;
+        let received_frame_size = self.read_bytes(
+            read_buffer,
+            2,
+            expected_frame_size.saturating_sub(read_buffer.len()) as u16,
+        )?;
 
         // Register the reception as complete.
         self.raw_socket
             .command(&mut self.bus, register::socketn::Command::Receive)?;
 
-        // If we couldn't read the whole frame, drop it instead.
-        if received_frame_size < expected_frame_size {
-            Ok(0)
-        } else {
-            Ok(received_frame_size)
-        }
+        Ok(received_frame_size)
     }
 
     /// Write an ethernet frame to the device.
