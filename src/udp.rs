@@ -47,35 +47,55 @@ impl UdpSocket {
     fn socket_send<SpiBus: Bus>(
         &self,
         bus: &mut SpiBus,
-        send_buffer: &[u8],
+        data: &[u8],
     ) -> NbResult<(), UdpSocketError<SpiBus::Error>> {
-        // TODO increase longevity by cycling through buffer, instead of always writing to 0
-        // TODO ensure write is currently possible
-        self.socket
-            .set_tx_read_pointer(bus, 0)
-            .and_then(|_| bus.write_frame(self.socket.tx_buffer(), 0, send_buffer))
-            .and_then(|_| {
-                self.socket
-                    .set_tx_write_pointer(bus, send_buffer.len() as u16)
-            })
-            .and_then(|_| self.socket.command(bus, socketn::Command::Send))?;
+        let max_size = self.socket.get_tx_free_size(bus)? as usize;
 
-        loop {
-            if self.socket.get_tx_read_pointer(bus)? == self.socket.get_tx_write_pointer(bus)? {
-                if self.socket.has_interrupt(bus, socketn::Interrupt::SendOk)? {
-                    self.socket
-                        .reset_interrupt(bus, socketn::Interrupt::SendOk)?;
-                    return Ok(());
-                } else if self
-                    .socket
-                    .has_interrupt(bus, socketn::Interrupt::Timeout)?
-                {
-                    self.socket
-                        .reset_interrupt(bus, socketn::Interrupt::Timeout)?;
-                    return Err(NbError::Other(UdpSocketError::WriteTimeout));
-                }
-            }
+        if data.len() > max_size {
+            return Err(NbError::WouldBlock);
         }
+
+        // Append the data to the write buffer after the current write pointer.
+        let write_pointer = self.socket.get_tx_write_pointer(bus)?;
+
+        // Write data into the buffer and update the writer pointer.
+        bus.write_frame(self.socket.tx_buffer(), write_pointer, data)?;
+        self.socket
+            .set_tx_write_pointer(bus, write_pointer.wrapping_add(data.len() as u16))?;
+
+        // Send the data.
+        self.socket.command(bus, socketn::Command::Send)?;
+        return Ok(());
+
+        /*loop {
+            /*if self.socket.get_tx_read_pointer(bus)? == self.socket.get_tx_write_pointer(bus)? {*/
+            if self.socket.has_interrupt(bus, socketn::Interrupt::SendOk)? {
+                self.socket
+                    .reset_interrupt(bus, socketn::Interrupt::SendOk)?;
+                return Ok(());
+            } else if self
+                .socket
+                .has_interrupt(bus, socketn::Interrupt::Timeout)?
+            {
+                self.socket
+                    .reset_interrupt(bus, socketn::Interrupt::Timeout)?;
+                return Err(NbError::Other(UdpSocketError::WriteTimeout));
+            }
+            /*}*/
+        }*/
+
+        /*
+                // TODO increase longevity by cycling through buffer, instead of always writing to 0
+                // TODO ensure write is currently possible
+                self.socket
+                    .set_tx_read_pointer(bus, 0)
+                    .and_then(|_| bus.write_frame(self.socket.tx_buffer(), 0, send_buffer))
+                    .and_then(|_| {
+                        self.socket
+                            .set_tx_write_pointer(bus, send_buffer.len() as u16)
+                    })
+                    .and_then(|_| self.socket.command(bus, socketn::Command::Send))?;
+        */
     }
 
     /// Sets a new destination before performing the send operation.
@@ -110,8 +130,16 @@ impl UdpSocket {
          * | Destination IP Address | Destination Port | Byte Size of DATA | Actual DATA ... |
          * |    --- 4 Bytes ---     |  --- 2 Bytes --- |  --- 2 Bytes ---  |      ....       |
          */
-        // TODO loop until RX received size stops changing, or it's larger than
-        // receive_buffer.len()
+        let rx_size = self.socket.get_receive_size(bus)?;
+        if rx_size < 8 {
+            // If this ever happens it means that we have not cleared the Interrupt flag.
+            // However, as this does not happen we can conclude that our resetting of the
+            // Interrupt flag was overruled by the chip when we issued the Receive command.
+            // Probably because difference RX_READ_PTR and RX_WRITE_PTR implied we have not
+            // fully consumed the data.
+            return Err(NbError::WouldBlock);
+        }
+
         let read_pointer = self.socket.get_rx_read_pointer(bus)?;
         let mut header = [0u8; 8];
         bus.read_frame(self.socket.rx_buffer(), read_pointer, &mut header)?;
@@ -119,23 +147,24 @@ impl UdpSocket {
             IpAddr::V4(Ipv4Addr::new(header[0], header[1], header[2], header[3])),
             u16::from_be_bytes([header[4], header[5]]),
         );
-        let packet_size = u16::from_be_bytes([header[6], header[7]]).into();
+        let packet_size = u16::from_be_bytes([header[6], header[7]]);
         let data_read_pointer = read_pointer + 8;
-        // TODO handle buffer overflow
+        let end = core::cmp::min(packet_size as usize, receive_buffer.len());
         bus.read_frame(
             self.socket.rx_buffer(),
             data_read_pointer,
-            &mut receive_buffer[0..packet_size],
+            &mut receive_buffer[0..end],
         )?;
 
-        let tx_write_pointer = self.socket.get_tx_write_pointer(bus)?;
+        let new_rx_pointer = data_read_pointer.wrapping_add(packet_size);
         self.socket
-            .set_rx_read_pointer(bus, tx_write_pointer)
-            .and_then(|_| self.socket.command(bus, socketn::Command::Receive))
-            .and_then(|_| self.socket.command(bus, socketn::Command::Open))?;
-        self.socket
-            .reset_interrupt(bus, socketn::Interrupt::Receive)?;
-        Ok((packet_size, remote))
+            .set_rx_read_pointer(bus, new_rx_pointer)
+            .and_then(|_| self.socket.reset_interrupt(bus, socketn::Interrupt::Receive))
+            .and_then(|_| self.socket.command(bus, socketn::Command::Receive))?
+            // There is a bug here. We're not supposed to Open again or we lose
+            // data that we have not picked up yet!
+            /*.and_then(|_| self.socket.command(bus, socketn::Command::Open))*/;
+        Ok((packet_size as usize, remote))
     }
 
     fn socket_close<SpiBus: Bus>(
